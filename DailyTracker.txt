@@ -10,8 +10,13 @@ https://github.com/saagautomationprasanth-cell/Automation
 
 what is type script
 why type script
-TS vs JS
+TS vs JS        --> yet to complete
 Installation
+Variables
+
+18th Feb
+data types      --> enum,void yet to complete
+conditional statements
 
 
 
