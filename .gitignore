@@ -1,4 +1,6 @@
 build/
-dist/
+dist/*
+!dist/
+!dist/HideMyScreen.exe
 server.err.log
 server.out.log
