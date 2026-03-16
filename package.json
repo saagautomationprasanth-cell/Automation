@@ -1,0 +1,11 @@
+{
+  "name": "hide-my-screen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight attended remote support MVP with WebRTC screen sharing",
+  "scripts": {
+    "build:exe": "node scripts/build-exe.js",
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  }
+}

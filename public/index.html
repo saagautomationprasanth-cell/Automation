@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HideMyScreen</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero">
+        <p class="eyebrow">Lightweight Remote Support MVP</p>
+        <h1>HideMyScreen</h1>
+        <p class="hero-copy">
+          A small TeamViewer-style prototype built with plain browser APIs and a tiny Node server.
+          The host always has to approve the viewer before screen sharing starts.
+        </p>
+        <div class="tag-row">
+          <span class="tag">Session codes</span>
+          <span class="tag">Host approval</span>
+          <span class="tag">WebRTC screen sharing</span>
+        </div>
+      </section>
+
+      <section class="connection-panel">
+        <div>
+          <p class="panel-kicker">Shared Server</p>
+          <h2>Use one server for both laptops</h2>
+          <p class="panel-copy">
+            Install the app on each laptop if you want, but point both copies to the same server URL so they share one session system.
+          </p>
+        </div>
+
+        <label class="field compact-field">
+          <span class="label">Server URL</span>
+          <input id="serverUrlInput" placeholder="http://192.168.1.43:3000">
+        </label>
+
+        <div class="button-row compact-actions">
+          <button class="primary" id="saveServerUrlBtn">Save shared server</button>
+          <button class="secondary" id="useLocalServerBtn">Use this laptop</button>
+        </div>
+
+        <p class="server-note" id="currentServerLabel"></p>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Host</p>
+              <h2>Share your screen</h2>
+            </div>
+            <span class="status-pill" id="hostStatus">Idle</span>
+          </div>
+
+          <p class="panel-copy">
+            Start a support session, share the six-digit code, and approve the viewer when they request access.
+          </p>
+
+          <div class="session-code-box">
+            <span class="label">Session code</span>
+            <strong id="hostCode">------</strong>
+          </div>
+
+          <div class="button-row">
+            <button class="primary" id="startHostBtn">Start host session</button>
+            <button class="secondary" id="endHostBtn" disabled>End session</button>
+          </div>
+
+          <div class="pending-block">
+            <div class="subhead-row">
+              <h3>Pending viewers</h3>
+              <span id="pendingCount">0 waiting</span>
+            </div>
+            <div class="empty-state" id="pendingEmpty">Nobody is waiting yet.</div>
+            <ul class="request-list" id="pendingList"></ul>
+          </div>
+
+          <div class="video-frame small-frame">
+            <div class="frame-label">Local preview</div>
+            <video id="localPreview" autoplay muted playsinline></video>
+          </div>
+
+          <div class="log-block">
+            <div class="subhead-row">
+              <h3>Host log</h3>
+              <button class="ghost" id="clearHostLogBtn">Clear</button>
+            </div>
+            <div class="log-list" id="hostLog"></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Viewer</p>
+              <h2>Join a live session</h2>
+            </div>
+            <span class="status-pill" id="viewerStatus">Idle</span>
+          </div>
+
+          <p class="panel-copy">
+            Enter the code from the host, wait for approval, and the shared screen appears here.
+          </p>
+
+          <label class="field">
+            <span class="label">Session code</span>
+            <input id="viewerCodeInput" inputmode="numeric" maxlength="6" placeholder="123456">
+          </label>
+
+          <div class="button-row">
+            <button class="primary" id="joinViewerBtn">Join session</button>
+            <button class="secondary" id="leaveViewerBtn" disabled>Leave</button>
+          </div>
+
+          <div class="video-frame">
+            <div class="frame-label">Remote screen</div>
+            <video id="remoteScreen" autoplay playsinline></video>
+            <div class="video-placeholder" id="viewerPlaceholder">
+              The remote stream will appear here after the host approves your request.
+            </div>
+          </div>
+
+          <div class="log-block">
+            <div class="subhead-row">
+              <h3>Viewer log</h3>
+              <button class="ghost" id="clearViewerLogBtn">Clear</button>
+            </div>
+            <div class="log-list" id="viewerLog"></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="footer-note">
+        <h3>What this MVP includes</h3>
+        <p>
+          It is designed for attended support only. There is no unattended access, no stealth install,
+          and no operating-system input control in this first version.
+        </p>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
