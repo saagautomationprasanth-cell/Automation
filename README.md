@@ -5,7 +5,8 @@
 - the host starts a session and gets a short share code
 - the viewer joins with that code
 - the host explicitly approves the request
-- the host's browser shares its screen to the viewer over WebRTC
+- the host's browser shares its screen, and optionally its system audio, to the viewer over WebRTC
+- the viewer can send short readable replies that appear in the host UI
 
 This first version is intentionally small and safety-focused. It does **not** include unattended access, stealth installation, OS-level mouse/keyboard control, or file transfer.
 
@@ -26,8 +27,10 @@ node server.js
 
 3. Open `http://localhost:3000` in two browser windows or on two different machines that can reach the host.
 4. On the host side, click `Start host session`.
-5. Enter the six-digit code on the viewer side, then wait for approval.
-6. The host clicks `Approve`, chooses which screen or window to share, and the viewer receives the stream.
+5. Leave `Include laptop audio` enabled if you want the viewer to hear supported system audio from the host machine.
+6. Enter the six-digit code on the viewer side, then wait for approval.
+7. The host clicks `Approve`, chooses which screen or window to share, and enables `Share audio` or `System audio` in the browser picker if available.
+8. The viewer receives the stream and can use the `Reply feed` box to send readable text back to the host UI.
 
 ## Build a Windows EXE
 
@@ -164,6 +167,8 @@ node server.js
 ## Notes
 
 - `getDisplayMedia` is user-consent based and works best on `localhost` or HTTPS.
+- System audio availability depends on the browser, operating system, and the screen or tab chosen in the share picker.
+- The readable reply feed appears in the host UI. To let the other person read it directly, keep the host app visible in the shared screen or shared window.
 - The MVP supports one active viewer at a time.
 - A public Google STUN server is included for basic NAT traversal. Real internet-scale deployment usually needs TURN as well.
 - Sessions are stored in memory, so restarting the server clears all active sessions.

@@ -58,6 +58,14 @@
             Start a support session, share the six-digit code, and approve the viewer when they request access.
           </p>
 
+          <label class="toggle-row">
+            <input id="shareAudioToggle" type="checkbox" checked>
+            <span>
+              Include laptop audio when the browser supports it
+              <small>When the picker opens, also turn on Share audio or System audio if your browser shows that option.</small>
+            </span>
+          </label>
+
           <div class="session-code-box">
             <span class="label">Session code</span>
             <strong id="hostCode">------</strong>
@@ -75,6 +83,21 @@
             </div>
             <div class="empty-state" id="pendingEmpty">Nobody is waiting yet.</div>
             <ul class="request-list" id="pendingList"></ul>
+          </div>
+
+          <div class="feed-block host-feed-block">
+            <div class="subhead-row">
+              <h3>Live reply feed</h3>
+              <span id="hostFeedCount">0 messages</span>
+            </div>
+            <div class="empty-state" id="hostFeedEmpty">
+              Replies from the viewer will appear here in larger text so the other person can read them.
+            </div>
+            <div class="feed-highlight" id="hostFeedHighlight" hidden>
+              <p id="hostFeedHighlightText"></p>
+              <span id="hostFeedHighlightMeta"></span>
+            </div>
+            <div class="feed-list" id="hostFeedList"></div>
           </div>
 
           <div class="video-frame small-frame">
@@ -120,6 +143,29 @@
             <div class="video-placeholder" id="viewerPlaceholder">
               The remote stream will appear here after the host approves your request.
             </div>
+          </div>
+
+          <div class="audio-assist" id="viewerAudioAssist" hidden>
+            <span>The host audio is ready, but your browser may need one more click to start playback.</span>
+            <button class="ghost" id="enableRemoteAudioBtn" type="button">Enable audio</button>
+          </div>
+
+          <div class="feed-block">
+            <div class="subhead-row">
+              <h3>Reply feed</h3>
+              <span id="viewerFeedCount">0 messages</span>
+            </div>
+            <div class="empty-state" id="viewerFeedEmpty">
+              Type a short reply after approval. It will appear on the host side so the other person can read it.
+            </div>
+            <label class="field">
+              <span class="label">Your reply</span>
+              <textarea id="viewerFeedInput" rows="3" maxlength="280" placeholder="Type a short reply for the other laptop to read..." disabled></textarea>
+            </label>
+            <div class="button-row compact-actions">
+              <button class="primary" id="sendViewerFeedBtn" disabled>Send reply</button>
+            </div>
+            <div class="feed-list" id="viewerFeedList"></div>
           </div>
 
           <div class="log-block">

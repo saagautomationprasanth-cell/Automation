@@ -2,6 +2,7 @@ let rtcConfig = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
 
+const FEED_TEXT_MAX_LENGTH = 280;
 const SERVER_URL_STORAGE_KEY = "hideMyScreen.serverUrl";
 const LOCAL_SERVER_URL = window.location.origin;
 
@@ -60,6 +61,8 @@ const hostState = {
   clientId: null,
   code: null,
   eventSource: null,
+  feedEntries: [],
+  feedIds: new Set(),
   pc: null,
   pendingViewers: new Map(),
   stream: null,
@@ -67,10 +70,14 @@ const hostState = {
 };
 
 const viewerState = {
+  approved: false,
   clientId: null,
   code: null,
   eventSource: null,
   hostId: null,
+  feedEntries: [],
+  feedIds: new Set(),
+  playbackPromptShown: false,
   pc: null,
   remoteStream: null,
   token: null,
@@ -80,8 +87,15 @@ const elements = {
   currentServerLabel: document.getElementById("currentServerLabel"),
   clearHostLogBtn: document.getElementById("clearHostLogBtn"),
   clearViewerLogBtn: document.getElementById("clearViewerLogBtn"),
+  enableRemoteAudioBtn: document.getElementById("enableRemoteAudioBtn"),
   endHostBtn: document.getElementById("endHostBtn"),
   hostCode: document.getElementById("hostCode"),
+  hostFeedCount: document.getElementById("hostFeedCount"),
+  hostFeedEmpty: document.getElementById("hostFeedEmpty"),
+  hostFeedHighlight: document.getElementById("hostFeedHighlight"),
+  hostFeedHighlightMeta: document.getElementById("hostFeedHighlightMeta"),
+  hostFeedHighlightText: document.getElementById("hostFeedHighlightText"),
+  hostFeedList: document.getElementById("hostFeedList"),
   hostLog: document.getElementById("hostLog"),
   hostStatus: document.getElementById("hostStatus"),
   joinViewerBtn: document.getElementById("joinViewerBtn"),
@@ -92,13 +106,20 @@ const elements = {
   pendingList: document.getElementById("pendingList"),
   remoteScreen: document.getElementById("remoteScreen"),
   saveServerUrlBtn: document.getElementById("saveServerUrlBtn"),
+  shareAudioToggle: document.getElementById("shareAudioToggle"),
   startHostBtn: document.getElementById("startHostBtn"),
   serverUrlInput: document.getElementById("serverUrlInput"),
   useLocalServerBtn: document.getElementById("useLocalServerBtn"),
   viewerCodeInput: document.getElementById("viewerCodeInput"),
+  viewerFeedCount: document.getElementById("viewerFeedCount"),
+  viewerFeedEmpty: document.getElementById("viewerFeedEmpty"),
+  viewerFeedInput: document.getElementById("viewerFeedInput"),
+  viewerFeedList: document.getElementById("viewerFeedList"),
   viewerLog: document.getElementById("viewerLog"),
   viewerPlaceholder: document.getElementById("viewerPlaceholder"),
   viewerStatus: document.getElementById("viewerStatus"),
+  viewerAudioAssist: document.getElementById("viewerAudioAssist"),
+  sendViewerFeedBtn: document.getElementById("sendViewerFeedBtn"),
 };
 
 function formatTime(value = Date.now()) {
@@ -172,6 +193,113 @@ function updateViewerPlaceholder() {
   elements.viewerPlaceholder.hidden = hasStream;
 }
 
+function resetFeedState(state) {
+  state.feedEntries = [];
+  state.feedIds = new Set();
+}
+
+function storeFeedEntry(state, entry) {
+  if (!entry?.id || state.feedIds.has(entry.id)) {
+    return false;
+  }
+
+  state.feedIds.add(entry.id);
+  state.feedEntries.push(entry);
+  state.feedEntries.sort((left, right) => left.createdAt - right.createdAt);
+  return true;
+}
+
+function replaceFeedEntries(state, entries = []) {
+  resetFeedState(state);
+  for (const entry of entries) {
+    storeFeedEntry(state, entry);
+  }
+}
+
+function buildFeedItem(entry) {
+  const item = document.createElement("article");
+  item.className = `feed-item ${entry.senderRole === "viewer" ? "feed-item-viewer" : "feed-item-host"}`;
+
+  const meta = document.createElement("div");
+  meta.className = "feed-meta";
+
+  const author = document.createElement("strong");
+  author.textContent = entry.senderRole === "viewer" ? "Remote reply" : "Host note";
+
+  const timestamp = document.createElement("span");
+  timestamp.textContent = formatTime(entry.createdAt);
+
+  meta.append(author, timestamp);
+
+  const text = document.createElement("p");
+  text.className = "feed-text";
+  text.textContent = entry.text;
+
+  item.append(meta, text);
+  return item;
+}
+
+function renderHostFeed() {
+  const messages = [...hostState.feedEntries].reverse();
+  elements.hostFeedCount.textContent = `${messages.length} message${messages.length === 1 ? "" : "s"}`;
+  elements.hostFeedList.innerHTML = "";
+  elements.hostFeedEmpty.hidden = messages.length > 0;
+
+  const latestViewerReply = messages.find((entry) => entry.senderRole === "viewer");
+  elements.hostFeedHighlight.hidden = !latestViewerReply;
+
+  if (latestViewerReply) {
+    elements.hostFeedHighlightText.textContent = latestViewerReply.text;
+    elements.hostFeedHighlightMeta.textContent = `Remote reply at ${formatTime(latestViewerReply.createdAt)}`;
+  } else {
+    elements.hostFeedHighlightText.textContent = "";
+    elements.hostFeedHighlightMeta.textContent = "";
+  }
+
+  for (const entry of messages) {
+    elements.hostFeedList.append(buildFeedItem(entry));
+  }
+}
+
+function renderViewerFeed() {
+  const messages = [...viewerState.feedEntries].reverse();
+  elements.viewerFeedCount.textContent = `${messages.length} message${messages.length === 1 ? "" : "s"}`;
+  elements.viewerFeedList.innerHTML = "";
+  elements.viewerFeedEmpty.hidden = messages.length > 0;
+
+  for (const entry of messages) {
+    elements.viewerFeedList.append(buildFeedItem(entry));
+  }
+}
+
+function getViewerFeedDraft() {
+  return elements.viewerFeedInput.value.replace(/\s+/g, " ").trim().slice(0, FEED_TEXT_MAX_LENGTH);
+}
+
+function updateViewerFeedComposer() {
+  const canSend = viewerState.approved && Boolean(getViewerFeedDraft());
+  elements.viewerFeedInput.disabled = !viewerState.approved;
+  elements.sendViewerFeedBtn.disabled = !canSend;
+}
+
+async function tryPlayRemoteScreen() {
+  if (!elements.remoteScreen.srcObject) {
+    return;
+  }
+
+  try {
+    await elements.remoteScreen.play();
+    elements.viewerAudioAssist.hidden = true;
+    viewerState.playbackPromptShown = false;
+  } catch (error) {
+    elements.viewerAudioAssist.hidden = false;
+    if (!viewerState.playbackPromptShown) {
+      addLog(elements.viewerLog, "Remote playback is ready. Click Enable audio if your browser blocks autoplay.");
+      viewerState.playbackPromptShown = true;
+    }
+  }
+}
+
 function renderPendingViewers() {
   const viewers = [...hostState.pendingViewers.values()].sort(
     (left, right) => left.requestedAt - right.requestedAt
@@ -216,12 +344,14 @@ async function apiRequest(path, payload) {
 function wireEventSource(source, handlers) {
   const registrations = [
     ["connected", handlers.connected],
+    ["feed-state", handlers.feedState],
     ["join-approved", handlers.joinApproved],
     ["join-denied", handlers.joinDenied],
     ["ping", handlers.ping],
     ["session-ended", handlers.sessionEnded],
     ["session-state", handlers.sessionState],
     ["signal", handlers.signal],
+    ["text-feed", handlers.textFeed],
     ["viewer-left", handlers.viewerLeft],
     ["viewer-request", handlers.viewerRequest],
   ];
@@ -263,12 +393,33 @@ async function ensureDisplayStream() {
     throw new Error("This browser does not support screen sharing");
   }
 
+  const includeSystemAudio = elements.shareAudioToggle.checked;
   const stream = await navigator.mediaDevices.getDisplayMedia({
-    audio: false,
+    audio: includeSystemAudio
+      ? {
+          autoGainControl: false,
+          echoCancellation: false,
+          noiseSuppression: false,
+        }
+      : false,
+    systemAudio: includeSystemAudio ? "include" : "exclude",
     video: {
       frameRate: { ideal: 12, max: 15 },
     },
   });
+
+  if (includeSystemAudio) {
+    if (stream.getAudioTracks().length > 0) {
+      addLog(elements.hostLog, "Screen sharing includes system audio when the chosen browser surface allows it.");
+    } else {
+      addLog(
+        elements.hostLog,
+        "The selected screen/window did not expose system audio. In the picker, choose a surface that supports audio and enable Share audio."
+      );
+    }
+  } else {
+    addLog(elements.hostLog, "Screen sharing started without shared laptop audio.");
+  }
 
   const [track] = stream.getVideoTracks();
   if (track) {
@@ -297,6 +448,9 @@ function destroyHostPeer() {
   }
 
   hostState.activeViewerId = null;
+  if (hostState.code) {
+    setHostStatus("Waiting");
+  }
   renderPendingViewers();
 }
 
@@ -311,7 +465,9 @@ function destroyViewerPeer() {
 
   viewerState.hostId = null;
   viewerState.remoteStream = null;
+  viewerState.playbackPromptShown = false;
   elements.remoteScreen.srcObject = null;
+  elements.viewerAudioAssist.hidden = true;
   updateViewerPlaceholder();
 }
 
@@ -343,6 +499,7 @@ async function buildHostPeer(viewerId) {
 
     if (["closed", "disconnected", "failed"].includes(pc.connectionState)) {
       hostState.activeViewerId = null;
+      setHostStatus("Waiting");
       renderPendingViewers();
     }
   };
@@ -363,9 +520,18 @@ function buildViewerPeer(hostId) {
 
   pc.ontrack = (event) => {
     const [remoteStream] = event.streams;
+    const isNewStream = viewerState.remoteStream?.id !== remoteStream?.id;
     viewerState.remoteStream = remoteStream;
     elements.remoteScreen.srcObject = remoteStream;
     updateViewerPlaceholder();
+    if (isNewStream) {
+      if (remoteStream?.getAudioTracks().length) {
+        addLog(elements.viewerLog, "Remote system audio is available. Use Enable audio if autoplay is blocked.");
+      } else {
+        addLog(elements.viewerLog, "Remote screen connected without shared audio.");
+      }
+    }
+    void tryPlayRemoteScreen();
   };
 
   pc.onicecandidate = async (event) => {
@@ -393,6 +559,8 @@ function resetHostUi() {
   elements.startHostBtn.disabled = false;
   elements.endHostBtn.disabled = true;
   hostState.pendingViewers.clear();
+  resetFeedState(hostState);
+  renderHostFeed();
   renderPendingViewers();
 }
 
@@ -400,6 +568,11 @@ function resetViewerUi() {
   setViewerStatus("Idle");
   elements.joinViewerBtn.disabled = false;
   elements.leaveViewerBtn.disabled = true;
+  elements.viewerFeedInput.value = "";
+  viewerState.approved = false;
+  resetFeedState(viewerState);
+  renderViewerFeed();
+  updateViewerFeedComposer();
   updateViewerPlaceholder();
 }
 
@@ -421,6 +594,10 @@ async function startHostSession() {
 
     wireEventSource(eventSource, {
       connected: () => addLog(elements.hostLog, "Host channel connected."),
+      feedState: (payload) => {
+        replaceFeedEntries(hostState, payload.messages);
+        renderHostFeed();
+      },
       sessionEnded: (payload) => {
         addLog(elements.hostLog, `Session ended: ${payload.reason}`);
         cleanupHostSession();
@@ -447,6 +624,15 @@ async function startHostSession() {
 
         if (payload.signalType === "candidate") {
           await hostState.pc.addIceCandidate(payload.payload);
+        }
+      },
+      textFeed: (payload) => {
+        if (storeFeedEntry(hostState, payload)) {
+          renderHostFeed();
+        }
+
+        if (payload.senderRole === "viewer") {
+          addLog(elements.hostLog, "A new readable reply arrived from the viewer.");
         }
       },
       viewerLeft: (payload) => {
@@ -527,9 +713,9 @@ async function approveViewer(viewerId) {
 
     hostState.pendingViewers.delete(viewerId);
     renderPendingViewers();
-    setHostStatus("Sharing");
     addLog(elements.hostLog, `Viewer approved: ${viewerId.slice(0, 12)}`);
     await buildHostPeer(viewerId);
+    setHostStatus("Sharing");
   } catch (error) {
     addLog(elements.hostLog, `Approval failed: ${error.message}`);
   }
@@ -567,9 +753,11 @@ async function joinViewerSession() {
     viewerState.code = data.code;
     viewerState.clientId = data.clientId;
     viewerState.token = data.token;
+    viewerState.approved = false;
     setViewerStatus("Pending");
     elements.joinViewerBtn.disabled = true;
     elements.leaveViewerBtn.disabled = false;
+    updateViewerFeedComposer();
     addLog(elements.viewerLog, `Join request sent for ${data.code}.`);
 
     const eventSource = new EventSource(buildEventSourceUrl(data.code, data.clientId, data.token));
@@ -577,7 +765,11 @@ async function joinViewerSession() {
 
     wireEventSource(eventSource, {
       connected: () => addLog(elements.viewerLog, "Viewer channel connected."),
-      joinApproved: () => {
+      joinApproved: (payload) => {
+        viewerState.approved = true;
+        replaceFeedEntries(viewerState, payload.messages);
+        renderViewerFeed();
+        updateViewerFeedComposer();
         setViewerStatus("Approved");
         addLog(elements.viewerLog, "The host approved your request.");
       },
@@ -605,10 +797,45 @@ async function joinViewerSession() {
           await viewerState.pc.addIceCandidate(payload.payload);
         }
       },
+      textFeed: (payload) => {
+        if (storeFeedEntry(viewerState, payload)) {
+          renderViewerFeed();
+        }
+      },
     });
   } catch (error) {
     addLog(elements.viewerLog, `Join failed: ${error.message}`);
     cleanupViewerSession();
+  }
+}
+
+async function sendViewerFeed() {
+  if (!viewerState.code || !viewerState.clientId || !viewerState.approved) {
+    addLog(elements.viewerLog, "Wait for host approval before sending a reply.");
+    return;
+  }
+
+  const text = getViewerFeedDraft();
+  if (!text) {
+    addLog(elements.viewerLog, "Type a short reply before sending.");
+    return;
+  }
+
+  try {
+    const data = await apiRequest("/api/feed", {
+      clientId: viewerState.clientId,
+      code: viewerState.code,
+      text,
+      token: viewerState.token,
+    });
+
+    storeFeedEntry(viewerState, data.entry);
+    renderViewerFeed();
+    elements.viewerFeedInput.value = "";
+    updateViewerFeedComposer();
+    addLog(elements.viewerLog, "Reply sent to the host screen.");
+  } catch (error) {
+    addLog(elements.viewerLog, `Reply failed: ${error.message}`);
   }
 }
 
@@ -659,6 +886,10 @@ elements.clearViewerLogBtn.addEventListener("click", () => {
   elements.viewerLog.innerHTML = "";
 });
 
+elements.enableRemoteAudioBtn.addEventListener("click", () => {
+  void tryPlayRemoteScreen();
+});
+
 elements.pendingList.addEventListener("click", async (event) => {
   const button = event.target.closest("button");
   if (!button) {
@@ -684,6 +915,22 @@ elements.viewerCodeInput.addEventListener("input", () => {
   elements.viewerCodeInput.value = normalizeCode(elements.viewerCodeInput.value);
 });
 
+elements.viewerFeedInput.addEventListener("input", () => {
+  if (elements.viewerFeedInput.value.length > FEED_TEXT_MAX_LENGTH) {
+    elements.viewerFeedInput.value = elements.viewerFeedInput.value.slice(0, FEED_TEXT_MAX_LENGTH);
+  }
+  updateViewerFeedComposer();
+});
+
+elements.sendViewerFeedBtn.addEventListener("click", sendViewerFeed);
+
+elements.viewerFeedInput.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    void sendViewerFeed();
+  }
+});
+
 window.addEventListener("beforeunload", () => {
   hostState.eventSource?.close();
   viewerState.eventSource?.close();
@@ -693,4 +940,6 @@ elements.serverUrlInput.value = connectionState.serverUrl;
 resetHostUi();
 resetViewerUi();
 updateViewerPlaceholder();
+renderHostFeed();
+renderViewerFeed();
 loadRuntimeConfig().catch(() => {});

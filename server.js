@@ -10,6 +10,8 @@ const PORT = Number(process.env.PORT) || 3000;
 const CORS_ALLOW_ORIGIN = process.env.CORS_ALLOW_ORIGIN || "*";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const SESSION_TTL_MS = 60 * 60 * 1000;
+const FEED_HISTORY_LIMIT = 50;
+const FEED_MESSAGE_MAX_LENGTH = 280;
 const sessions = new Map();
 const AUTO_OPEN_BROWSER = !process.argv.includes("--no-browser");
 
@@ -239,6 +241,52 @@ function summarizeViewers(session) {
   }));
 }
 
+function summarizeFeed(session) {
+  return session.feed.map((entry) => ({
+    createdAt: entry.createdAt,
+    id: entry.id,
+    senderId: entry.senderId,
+    senderRole: entry.senderRole,
+    text: entry.text,
+  }));
+}
+
+function normalizeFeedText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, FEED_MESSAGE_MAX_LENGTH);
+}
+
+function canExchangeFeed(session, match) {
+  if (!session || !match) {
+    return false;
+  }
+
+  if (match.role === "host") {
+    return true;
+  }
+
+  return session.activeViewerId === match.participant.id && match.participant.status === "approved";
+}
+
+function appendFeedEntry(session, senderRole, senderId, text) {
+  const entry = {
+    createdAt: Date.now(),
+    id: `feed_${crypto.randomUUID()}`,
+    senderId,
+    senderRole,
+    text,
+  };
+
+  session.feed.push(entry);
+  if (session.feed.length > FEED_HISTORY_LIMIT) {
+    session.feed.shift();
+  }
+
+  return entry;
+}
+
 function endSession(session, reason) {
   if (!session || session.endedAt) {
     return;
@@ -361,6 +409,7 @@ async function handleApi(req, res, url) {
       code: createCode(),
       createdAt: Date.now(),
       endedAt: null,
+      feed: [],
       host: createParticipant("host"),
       viewers: new Map(),
     };
@@ -410,8 +459,14 @@ async function handleApi(req, res, url) {
         activeViewerId: session.activeViewerId,
         viewers: summarizeViewers(session),
       });
+      sendEvent(res, "feed-state", {
+        messages: summarizeFeed(session),
+      });
     } else if (match.participant.status === "approved") {
-      sendEvent(res, "join-approved", { viewerId: match.participant.id });
+      sendEvent(res, "join-approved", {
+        messages: summarizeFeed(session),
+        viewerId: match.participant.id,
+      });
     } else if (match.participant.status === "denied") {
       sendEvent(res, "join-denied", { viewerId: match.participant.id });
     }
@@ -487,7 +542,10 @@ async function handleApi(req, res, url) {
 
       viewer.status = "approved";
       session.activeViewerId = viewer.id;
-      sendEvent(viewer.channel, "join-approved", { viewerId: viewer.id });
+      sendEvent(viewer.channel, "join-approved", {
+        messages: summarizeFeed(session),
+        viewerId: viewer.id,
+      });
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -536,6 +594,42 @@ async function handleApi(req, res, url) {
     });
 
     sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/feed") {
+    const body = await readJsonBody(req);
+    const session = getSession(body.code);
+    const match = validateParticipant(session, body.clientId, body.token);
+
+    if (!match) {
+      sendJson(res, 401, { error: "Invalid session credentials" });
+      return;
+    }
+
+    if (!canExchangeFeed(session, match)) {
+      sendJson(res, 403, { error: "Feed is available only during an approved session" });
+      return;
+    }
+
+    const text = normalizeFeedText(body.text);
+    if (!text) {
+      sendJson(res, 400, { error: "Reply text is required" });
+      return;
+    }
+
+    const entry = appendFeedEntry(session, match.role, match.participant.id, text);
+    sendEvent(session.host.channel, "text-feed", entry);
+
+    if (session.activeViewerId) {
+      const activeViewer = session.viewers.get(session.activeViewerId);
+      sendEvent(activeViewer?.channel, "text-feed", entry);
+    }
+
+    sendJson(res, 200, {
+      entry,
+      ok: true,
+    });
     return;
   }
 
