@@ -51,7 +51,14 @@ async function loadRuntimeConfig() {
       };
     }
 
-    describeCurrentServer("Unique session IDs are created on this server.");
+    const iceSummary =
+      data.iceSource === "dynamic"
+        ? `ICE: ${data.iceProvider} TURN is configured on the server.`
+        : data.iceSource === "fallback-static"
+          ? "ICE: TURN provider fetch failed, so the server is using static fallback ICE values."
+          : "ICE: static STUN/TURN values are configured on the server.";
+
+    describeCurrentServer(`Unique session IDs are created on this server. ${iceSummary}`);
   } catch (error) {
     describeCurrentServer("This server could not be reached.");
     console.warn("Falling back to default ICE config:", error);

@@ -145,6 +145,8 @@ For users outside your local network, this MVP should be hosted on a machine wit
 
 The client now loads ICE settings from the server at runtime, so you can configure STUN and TURN without changing browser code.
 
+The safest pattern is to keep TURN provider credentials on the server only and let the browser fetch ICE settings from `/api/config`.
+
 Example PowerShell environment setup:
 
 ```powershell
@@ -164,6 +166,70 @@ $env:ICE_SERVERS = '[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:your-
 node server.js
 ```
 
+### Public TURN provider: Twilio
+
+If you use Twilio Network Traversal Service, the server can fetch fresh TURN credentials for clients at runtime.
+
+```powershell
+$env:HOST = "0.0.0.0"
+$env:PORT = "3000"
+$env:ICE_PROVIDER = "twilio"
+$env:TWILIO_ACCOUNT_SID = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+$env:TWILIO_AUTH_TOKEN = "your-twilio-auth-token"
+$env:TWILIO_TURN_TTL = "3600"
+node server.js
+```
+
+Optional:
+
+- `TWILIO_TURN_REGION` to pin `global.twilio.com` URLs to a region such as `us1` when needed
+- `STUN_URLS` or `ICE_SERVERS` as a fallback if the provider cannot be reached
+
+### Public TURN provider: Metered
+
+If you use Metered, the server can request TURN credentials from your Metered app and cache them.
+
+```powershell
+$env:HOST = "0.0.0.0"
+$env:PORT = "3000"
+$env:ICE_PROVIDER = "metered"
+$env:METERED_APP_NAME = "your-metered-app-name"
+$env:METERED_API_KEY = "your-metered-api-key"
+$env:METERED_REGION = "global"
+node server.js
+```
+
+Optional:
+
+- `METERED_CACHE_TTL_MS` to control how long the server caches Metered credentials before refreshing
+- `STUN_URLS` or `ICE_SERVERS` as a fallback if the provider cannot be reached
+
+### Render environment example
+
+On Render, add these environment variables to your service instead of hard-coding ICE values in the frontend.
+
+Twilio example:
+
+```text
+HOST=0.0.0.0
+PORT=10000
+ICE_PROVIDER=twilio
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your-twilio-auth-token
+TWILIO_TURN_TTL=3600
+```
+
+Metered example:
+
+```text
+HOST=0.0.0.0
+PORT=10000
+ICE_PROVIDER=metered
+METERED_APP_NAME=your-metered-app-name
+METERED_API_KEY=your-metered-api-key
+METERED_REGION=global
+```
+
 ## Notes
 
 - `getDisplayMedia` is user-consent based and works best on `localhost` or HTTPS.
@@ -171,6 +237,7 @@ node server.js
 - The readable reply feed appears in the host UI. To let the other person read it directly, keep the host app visible in the shared screen or shared window.
 - The MVP supports one active viewer at a time.
 - A public Google STUN server is included for basic NAT traversal. Real internet-scale deployment usually needs TURN as well.
+- The server now supports provider-backed TURN credentials for Twilio and Metered, while keeping static `ICE_SERVERS`, `STUN_URLS`, and `TURN_*` values as a fallback.
 - Sessions are stored in memory, so restarting the server clears all active sessions.
 - Real-time signaling now uses WebSockets. Session creation and join still start over normal HTTP endpoints.
 - This is still an MVP, not a production-hardened remote support service. It needs authentication, rate limiting, audit logging, and persistent storage before wider public use.

@@ -15,6 +15,8 @@ const FEED_MESSAGE_MAX_LENGTH = 280;
 const SESSION_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const SESSION_ID_PART_LENGTH = 4;
 const SESSION_ID_PARTS = 3;
+const DEFAULT_METERED_CACHE_TTL_MS = 5 * 60 * 1000;
+const ICE_CACHE_MIN_TTL_MS = 60 * 1000;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_WEBSOCKET_MESSAGE_BYTES = 64 * 1024;
 const sessions = new Map();
@@ -184,7 +186,258 @@ function buildIceServers() {
   return iceServers;
 }
 
-const ICE_SERVERS = buildIceServers();
+const STATIC_ICE_SERVERS = buildIceServers();
+const ICE_PROVIDER = String(process.env.ICE_PROVIDER || "")
+  .trim()
+  .toLowerCase();
+const iceServerCache = {
+  expiresAt: 0,
+  fetchedAt: null,
+  inFlightPromise: null,
+  provider: null,
+  servers: STATIC_ICE_SERVERS,
+  source: "static",
+};
+
+function base64Encode(value) {
+  return Buffer.from(String(value), "utf8").toString("base64");
+}
+
+function dedupeIceServers(entries) {
+  const seen = new Set();
+  const result = [];
+
+  for (const entry of entries) {
+    const normalized = normalizeIceEntry(entry);
+    if (!normalized) {
+      continue;
+    }
+
+    const key = JSON.stringify(normalized);
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(normalized);
+  }
+
+  return result;
+}
+
+function getConfiguredIceProvider() {
+  if (ICE_PROVIDER) {
+    return ICE_PROVIDER;
+  }
+
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    return "twilio";
+  }
+
+  if (process.env.METERED_APP_NAME && process.env.METERED_API_KEY) {
+    return "metered";
+  }
+
+  return "static";
+}
+
+function getTwilioCacheTtlMs(payload) {
+  const configuredTtlSeconds = Number(process.env.TWILIO_TURN_TTL) || Number(payload?.ttl) || 3600;
+  return Math.max(ICE_CACHE_MIN_TTL_MS, configuredTtlSeconds * 1000 - 60 * 1000);
+}
+
+function getMeteredCacheTtlMs() {
+  const configuredTtlMs = Number(process.env.METERED_CACHE_TTL_MS) || DEFAULT_METERED_CACHE_TTL_MS;
+  return Math.max(ICE_CACHE_MIN_TTL_MS, configuredTtlMs);
+}
+
+function maybePinTwilioRegion(entry) {
+  const region = String(process.env.TWILIO_TURN_REGION || "")
+    .trim()
+    .toLowerCase();
+
+  if (!region) {
+    return entry;
+  }
+
+  const replaceGlobal = (value) =>
+    String(value || "").replace(
+      /^(stun|turn|turns):global\.([a-z0-9.-]+)/i,
+      (_, protocol, host) => `${protocol}:${region}.${host}`
+    );
+
+  return {
+    ...entry,
+    urls: Array.isArray(entry.urls) ? entry.urls.map(replaceGlobal) : replaceGlobal(entry.urls),
+  };
+}
+
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : {};
+
+  if (!response.ok) {
+    throw new Error(payload.message || payload.error || `Request failed with status ${response.status}`);
+  }
+
+  return payload;
+}
+
+async function fetchTwilioIceServers() {
+  const accountSid = String(process.env.TWILIO_ACCOUNT_SID || "").trim();
+  const authToken = String(process.env.TWILIO_AUTH_TOKEN || "").trim();
+
+  if (!accountSid || !authToken) {
+    throw new Error("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are required for ICE_PROVIDER=twilio");
+  }
+
+  const endpoint = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(accountSid)}/Tokens.json`;
+  const body = new URLSearchParams();
+  if (process.env.TWILIO_TURN_TTL) {
+    body.set("Ttl", String(process.env.TWILIO_TURN_TTL));
+  }
+
+  const payload = await fetchJson(endpoint, {
+    body,
+    headers: {
+      Authorization: `Basic ${base64Encode(`${accountSid}:${authToken}`)}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    method: "POST",
+  });
+
+  const servers = dedupeIceServers(
+    Array.isArray(payload.ice_servers) ? payload.ice_servers.map(maybePinTwilioRegion) : []
+  );
+
+  if (!servers.length) {
+    throw new Error("Twilio did not return any ICE servers");
+  }
+
+  return {
+    fetchedAt: Date.now(),
+    provider: "twilio",
+    servers,
+    source: "dynamic",
+    ttlMs: getTwilioCacheTtlMs(payload),
+  };
+}
+
+async function fetchMeteredIceServers() {
+  const appName = String(process.env.METERED_APP_NAME || "").trim();
+  const apiKey = String(process.env.METERED_API_KEY || "").trim();
+
+  if (!appName || !apiKey) {
+    throw new Error("METERED_APP_NAME and METERED_API_KEY are required for ICE_PROVIDER=metered");
+  }
+
+  const endpoint = new URL(`https://${appName}.metered.live/api/v1/turn/credentials`);
+  endpoint.searchParams.set("apiKey", apiKey);
+
+  if (process.env.METERED_REGION) {
+    endpoint.searchParams.set("region", String(process.env.METERED_REGION).trim());
+  }
+
+  const payload = await fetchJson(endpoint, {
+    method: "GET",
+  });
+
+  const servers = dedupeIceServers(Array.isArray(payload) ? payload : []);
+  if (!servers.length) {
+    throw new Error("Metered did not return any ICE servers");
+  }
+
+  return {
+    fetchedAt: Date.now(),
+    provider: "metered",
+    servers,
+    source: "dynamic",
+    ttlMs: getMeteredCacheTtlMs(),
+  };
+}
+
+async function fetchProviderIceServers() {
+  const provider = getConfiguredIceProvider();
+
+  if (provider === "twilio") {
+    return fetchTwilioIceServers();
+  }
+
+  if (provider === "metered") {
+    return fetchMeteredIceServers();
+  }
+
+  return {
+    fetchedAt: Date.now(),
+    provider: "static",
+    servers: STATIC_ICE_SERVERS,
+    source: "static",
+    ttlMs: Number.MAX_SAFE_INTEGER,
+  };
+}
+
+async function getRuntimeIceConfig() {
+  const provider = getConfiguredIceProvider();
+  if (provider === "static") {
+    return {
+      fetchedAt: Date.now(),
+      provider: "static",
+      servers: STATIC_ICE_SERVERS,
+      source: "static",
+    };
+  }
+
+  if (
+    iceServerCache.provider === provider &&
+    iceServerCache.servers.length &&
+    Date.now() < iceServerCache.expiresAt
+  ) {
+    return {
+      fetchedAt: iceServerCache.fetchedAt,
+      provider: iceServerCache.provider,
+      servers: iceServerCache.servers,
+      source: iceServerCache.source,
+    };
+  }
+
+  if (!iceServerCache.inFlightPromise) {
+    iceServerCache.inFlightPromise = fetchProviderIceServers()
+      .then((config) => {
+        iceServerCache.expiresAt = Date.now() + config.ttlMs;
+        iceServerCache.fetchedAt = config.fetchedAt;
+        iceServerCache.provider = config.provider;
+        iceServerCache.servers = config.servers;
+        iceServerCache.source = config.source;
+        return config;
+      })
+      .catch((error) => {
+        console.warn(`Failed to load ${provider} ICE servers:`, error.message);
+        iceServerCache.expiresAt = Date.now() + ICE_CACHE_MIN_TTL_MS;
+        iceServerCache.fetchedAt = Date.now();
+        iceServerCache.provider = provider;
+        iceServerCache.servers = STATIC_ICE_SERVERS;
+        iceServerCache.source = "fallback-static";
+        return {
+          fetchedAt: iceServerCache.fetchedAt,
+          provider,
+          servers: STATIC_ICE_SERVERS,
+          source: "fallback-static",
+        };
+      })
+      .finally(() => {
+        iceServerCache.inFlightPromise = null;
+      });
+  }
+
+  const config = await iceServerCache.inFlightPromise;
+  return {
+    fetchedAt: config.fetchedAt,
+    provider: config.provider,
+    servers: config.servers,
+    source: config.source,
+  };
+}
 
 function writeWebSocketFrame(socket, opcode, payload = Buffer.alloc(0)) {
   const payloadBuffer = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), "utf8");
@@ -893,8 +1146,11 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/config") {
+    const iceConfig = await getRuntimeIceConfig();
     sendJson(res, 200, {
-      iceServers: ICE_SERVERS,
+      iceProvider: iceConfig.provider,
+      iceSource: iceConfig.source,
+      iceServers: iceConfig.servers,
       sessionTtlMs: SESSION_TTL_MS,
     });
     return;
@@ -903,7 +1159,8 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, {
       host: HOST,
-      iceServers: ICE_SERVERS.length,
+      iceProvider: getConfiguredIceProvider(),
+      iceServers: STATIC_ICE_SERVERS.length,
       ok: true,
       sessions: sessions.size,
       time: new Date().toISOString(),
