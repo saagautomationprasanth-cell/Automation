@@ -2,8 +2,8 @@
 
 `HideMyScreen` is a lightweight, attended remote support MVP inspired by the basic flow of tools like TeamViewer:
 
-- the host starts a session and gets a short share code
-- the viewer joins with that code
+- the host starts a session and gets a unique session ID
+- the viewer joins with that session ID
 - the host explicitly approves the request
 - the host's browser shares its screen, and optionally its system audio, to the viewer over WebRTC
 - the viewer can send short readable replies that appear in the host UI
@@ -14,7 +14,7 @@ This first version is intentionally small and safety-focused. It does **not** in
 
 - `Node.js` built-in modules only for the HTTP server and signaling endpoints
 - plain `HTML`, `CSS`, and browser `JavaScript`
-- browser-native `WebRTC`, `EventSource`, and `getDisplayMedia`
+- browser-native `WebRTC`, `WebSocket`, and `getDisplayMedia`
 
 ## Run it
 
@@ -28,7 +28,7 @@ node server.js
 3. Open `http://localhost:3000` in two browser windows or on two different machines that can reach the host.
 4. On the host side, click `Start host session`.
 5. Leave `Include laptop audio` enabled if you want the viewer to hear supported system audio from the host machine.
-6. Enter the six-digit code on the viewer side, then wait for approval.
+6. Enter the session ID on the viewer side, then wait for approval.
 7. The host clicks `Approve`, chooses which screen or window to share, and enables `Share audio` or `System audio` in the browser picker if available.
 8. The viewer receives the stream and can use the `Reply feed` box to send readable text back to the host UI.
 
@@ -172,6 +172,7 @@ node server.js
 - The MVP supports one active viewer at a time.
 - A public Google STUN server is included for basic NAT traversal. Real internet-scale deployment usually needs TURN as well.
 - Sessions are stored in memory, so restarting the server clears all active sessions.
+- Real-time signaling now uses WebSockets. Session creation and join still start over normal HTTP endpoints.
 - This is still an MVP, not a production-hardened remote support service. It needs authentication, rate limiting, audit logging, and persistent storage before wider public use.
 
 ## Suggested next steps

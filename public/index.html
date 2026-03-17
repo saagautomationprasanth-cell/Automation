@@ -13,10 +13,10 @@
         <h1>HideMyScreen</h1>
         <p class="hero-copy">
           A small TeamViewer-style prototype built with plain browser APIs and a tiny Node server.
-          The host always has to approve the viewer before screen sharing starts.
+          The host always has to approve the viewer before screen sharing starts, and each session gets a unique public ID.
         </p>
         <div class="tag-row">
-          <span class="tag">Session codes</span>
+          <span class="tag">Unique session IDs</span>
           <span class="tag">Host approval</span>
           <span class="tag">WebRTC screen sharing</span>
         </div>
@@ -55,7 +55,7 @@
           </div>
 
           <p class="panel-copy">
-            Start a support session, share the six-digit code, and approve the viewer when they request access.
+            Start a support session, share the unique session ID, and approve the viewer when they request access.
           </p>
 
           <label class="toggle-row">
@@ -67,8 +67,8 @@
           </label>
 
           <div class="session-code-box">
-            <span class="label">Session code</span>
-            <strong id="hostCode">------</strong>
+            <span class="label">Session ID</span>
+            <strong id="hostSessionId">---- ---- ----</strong>
           </div>
 
           <div class="button-row">
@@ -124,12 +124,12 @@
           </div>
 
           <p class="panel-copy">
-            Enter the code from the host, wait for approval, and the shared screen appears here.
+            Enter the session ID from the host, wait for approval, and the shared screen appears here.
           </p>
 
           <label class="field">
-            <span class="label">Session code</span>
-            <input id="viewerCodeInput" inputmode="numeric" maxlength="6" placeholder="123456">
+            <span class="label">Session ID</span>
+            <input id="viewerSessionIdInput" inputmode="text" maxlength="14" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH-JKLM">
           </label>
 
           <div class="button-row">

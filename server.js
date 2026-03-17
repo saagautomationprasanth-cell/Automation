@@ -12,6 +12,11 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const SESSION_TTL_MS = 60 * 60 * 1000;
 const FEED_HISTORY_LIMIT = 50;
 const FEED_MESSAGE_MAX_LENGTH = 280;
+const SESSION_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const SESSION_ID_PART_LENGTH = 4;
+const SESSION_ID_PARTS = 3;
+const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_WEBSOCKET_MESSAGE_BYTES = 64 * 1024;
 const sessions = new Map();
 const AUTO_OPEN_BROWSER = !process.argv.includes("--no-browser");
 
@@ -39,6 +44,12 @@ function sendJson(res, statusCode, payload) {
     "Content-Type": "application/json; charset=utf-8",
   });
   res.end(JSON.stringify(payload));
+}
+
+function createRequestError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
 function applyCorsHeaders(res) {
@@ -175,9 +186,90 @@ function buildIceServers() {
 
 const ICE_SERVERS = buildIceServers();
 
-function sendEvent(channel, eventName, payload) {
-  if (!channel || channel.writableEnded) {
+function writeWebSocketFrame(socket, opcode, payload = Buffer.alloc(0)) {
+  const payloadBuffer = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), "utf8");
+  let offset = 2;
+
+  if (payloadBuffer.length >= 126 && payloadBuffer.length < 65536) {
+    offset += 2;
+  } else if (payloadBuffer.length >= 65536) {
+    offset += 8;
+  }
+
+  const frame = Buffer.alloc(offset + payloadBuffer.length);
+  frame[0] = 0x80 | opcode;
+
+  if (payloadBuffer.length < 126) {
+    frame[1] = payloadBuffer.length;
+  } else if (payloadBuffer.length < 65536) {
+    frame[1] = 126;
+    frame.writeUInt16BE(payloadBuffer.length, 2);
+  } else {
+    frame[1] = 127;
+    frame.writeBigUInt64BE(BigInt(payloadBuffer.length), 2);
+  }
+
+  payloadBuffer.copy(frame, offset);
+  socket.write(frame);
+}
+
+function isChannelOpen(channel) {
+  if (!channel) {
     return false;
+  }
+
+  if (channel.kind === "websocket") {
+    return !channel.closed && !channel.socket.destroyed && channel.socket.writable;
+  }
+
+  return !channel.writableEnded;
+}
+
+function closeChannel(channel) {
+  if (!channel) {
+    return;
+  }
+
+  if (channel.kind === "websocket") {
+    if (channel.closed) {
+      return;
+    }
+
+    channel.closed = true;
+    if (!channel.socket.destroyed) {
+      try {
+        writeWebSocketFrame(channel.socket, 0x8);
+      } catch {}
+      channel.socket.end();
+    }
+    return;
+  }
+
+  if (!channel.writableEnded) {
+    channel.end();
+  }
+}
+
+function replaceParticipantChannel(participant, nextChannel) {
+  if (participant.channel && participant.channel !== nextChannel) {
+    closeChannel(participant.channel);
+  }
+
+  participant.channel = nextChannel;
+}
+
+function sendEvent(channel, eventName, payload) {
+  if (!isChannelOpen(channel)) {
+    return false;
+  }
+
+  if (channel.kind === "websocket") {
+    writeWebSocketFrame(
+      channel.socket,
+      0x1,
+      Buffer.from(JSON.stringify({ payload, type: eventName }), "utf8")
+    );
+    return true;
   }
 
   channel.write(`event: ${eventName}\n`);
@@ -185,12 +277,125 @@ function sendEvent(channel, eventName, payload) {
   return true;
 }
 
-function createCode() {
-  let code = "";
+function sendSocketResponse(channel, requestId, { data = null, error = null, ok = true, statusCode = 200 } = {}) {
+  if (!requestId) {
+    return false;
+  }
+
+  return sendEvent(channel, "response", {
+    data,
+    error,
+    ok,
+    requestId,
+    statusCode,
+  });
+}
+
+function parseWebSocketFrame(buffer) {
+  if (buffer.length < 2) {
+    return null;
+  }
+
+  const firstByte = buffer[0];
+  const secondByte = buffer[1];
+  const fin = Boolean(firstByte & 0x80);
+  const opcode = firstByte & 0x0f;
+  const masked = Boolean(secondByte & 0x80);
+  let payloadLength = secondByte & 0x7f;
+  let offset = 2;
+
+  if (!fin) {
+    throw createRequestError(1003, "Fragmented WebSocket frames are not supported");
+  }
+
+  if (payloadLength === 126) {
+    if (buffer.length < offset + 2) {
+      return null;
+    }
+    payloadLength = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (payloadLength === 127) {
+    if (buffer.length < offset + 8) {
+      return null;
+    }
+
+    const longLength = buffer.readBigUInt64BE(offset);
+    if (longLength > BigInt(MAX_WEBSOCKET_MESSAGE_BYTES)) {
+      throw createRequestError(1009, "WebSocket message is too large");
+    }
+
+    payloadLength = Number(longLength);
+    offset += 8;
+  }
+
+  if (payloadLength > MAX_WEBSOCKET_MESSAGE_BYTES) {
+    throw createRequestError(1009, "WebSocket message is too large");
+  }
+
+  if (!masked) {
+    throw createRequestError(1002, "Client WebSocket frames must be masked");
+  }
+
+  if (buffer.length < offset + 4 + payloadLength) {
+    return null;
+  }
+
+  const mask = buffer.subarray(offset, offset + 4);
+  offset += 4;
+
+  const payload = Buffer.from(buffer.subarray(offset, offset + payloadLength));
+  for (let index = 0; index < payload.length; index += 1) {
+    payload[index] ^= mask[index % 4];
+  }
+
+  return {
+    length: offset + payloadLength,
+    opcode,
+    payload,
+  };
+}
+
+function createWebSocketChannel(socket, head) {
+  return {
+    buffer: head && head.length ? Buffer.from(head) : Buffer.alloc(0),
+    closed: false,
+    kind: "websocket",
+    socket,
+  };
+}
+
+function createSessionIdChunk() {
+  let value = "";
+  while (value.length < SESSION_ID_PART_LENGTH) {
+    const index = crypto.randomInt(0, SESSION_ID_ALPHABET.length);
+    value += SESSION_ID_ALPHABET[index];
+  }
+  return value;
+}
+
+function normalizeSessionId(value) {
+  const cleaned = String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .split("")
+    .filter((character) => SESSION_ID_ALPHABET.includes(character))
+    .join("")
+    .slice(0, SESSION_ID_PART_LENGTH * SESSION_ID_PARTS);
+
+  if (!cleaned) {
+    return "";
+  }
+
+  const parts = cleaned.match(new RegExp(`.{1,${SESSION_ID_PART_LENGTH}}`, "g")) || [];
+  return parts.join("-");
+}
+
+function createSessionId() {
+  let sessionId = "";
   do {
-    code = String(crypto.randomInt(100000, 1000000));
-  } while (sessions.has(code));
-  return code;
+    sessionId = Array.from({ length: SESSION_ID_PARTS }, () => createSessionIdChunk()).join("-");
+  } while (sessions.has(sessionId));
+  return sessionId;
 }
 
 function createParticipant(prefix) {
@@ -201,11 +406,16 @@ function createParticipant(prefix) {
   };
 }
 
-function getSession(code) {
-  if (!code) {
+function getRequestedSessionId(value) {
+  return normalizeSessionId(value);
+}
+
+function getSession(sessionId) {
+  const normalized = normalizeSessionId(sessionId);
+  if (!normalized) {
     return null;
   }
-  return sessions.get(String(code).trim());
+  return sessions.get(normalized);
 }
 
 function getParticipant(session, clientId) {
@@ -296,18 +506,14 @@ function endSession(session, reason) {
 
   for (const viewer of session.viewers.values()) {
     sendEvent(viewer.channel, "session-ended", { reason });
-    if (viewer.channel && !viewer.channel.writableEnded) {
-      viewer.channel.end();
-    }
+    closeChannel(viewer.channel);
     viewer.channel = null;
   }
 
   sendEvent(session.host.channel, "session-ended", { reason });
-  if (session.host.channel && !session.host.channel.writableEnded) {
-    session.host.channel.end();
-  }
+  closeChannel(session.host.channel);
   session.host.channel = null;
-  sessions.delete(session.code);
+  sessions.delete(session.sessionId);
 }
 
 function removeViewer(session, viewerId, reason) {
@@ -325,9 +531,7 @@ function removeViewer(session, viewerId, reason) {
   }
 
   sendEvent(viewer.channel, "session-ended", { reason });
-  if (viewer.channel && !viewer.channel.writableEnded) {
-    viewer.channel.end();
-  }
+  closeChannel(viewer.channel);
   viewer.channel = null;
   session.viewers.delete(viewerId);
 
@@ -376,6 +580,310 @@ async function serveStatic(res, pathname) {
   }
 }
 
+function sendParticipantSnapshot(channel, session, match) {
+  sendEvent(channel, "connected", {
+    code: session.sessionId,
+    role: match.role,
+    sessionId: session.sessionId,
+    serverTime: new Date().toISOString(),
+  });
+
+  if (match.role === "host") {
+    sendEvent(channel, "session-state", {
+      activeViewerId: session.activeViewerId,
+      viewers: summarizeViewers(session),
+    });
+    sendEvent(channel, "feed-state", {
+      messages: summarizeFeed(session),
+    });
+    return;
+  }
+
+  if (match.participant.status === "approved") {
+    sendEvent(channel, "join-approved", {
+      messages: summarizeFeed(session),
+      viewerId: match.participant.id,
+    });
+    return;
+  }
+
+  if (match.participant.status === "denied") {
+    sendEvent(channel, "join-denied", { viewerId: match.participant.id });
+  }
+}
+
+function handleParticipantDisconnect(session, match, channel, reason) {
+  if (match.participant.channel !== channel) {
+    return;
+  }
+
+  match.participant.channel = null;
+
+  if (match.role === "host") {
+    endSession(session, reason);
+    return;
+  }
+
+  removeViewer(session, match.participant.id, reason);
+}
+
+function assertHost(match) {
+  if (!match || match.role !== "host") {
+    throw createRequestError(401, "Only the host can approve viewers");
+  }
+}
+
+function sendSignalToParticipant(session, match, toId, signalType, payload) {
+  if (match.role === "host") {
+    if (session.activeViewerId !== toId) {
+      throw createRequestError(403, "Viewer is not active");
+    }
+  } else if (session.activeViewerId !== match.participant.id || toId !== session.host.id) {
+    throw createRequestError(403, "Viewer is not approved");
+  }
+
+  const recipientMatch = getParticipant(session, toId);
+  if (!recipientMatch) {
+    throw createRequestError(404, "Signal recipient not found");
+  }
+
+  sendEvent(recipientMatch.participant.channel, "signal", {
+    fromId: match.participant.id,
+    payload,
+    signalType,
+  });
+}
+
+function postFeedEntry(session, match, text) {
+  if (!canExchangeFeed(session, match)) {
+    throw createRequestError(403, "Feed is available only during an approved session");
+  }
+
+  const normalizedText = normalizeFeedText(text);
+  if (!normalizedText) {
+    throw createRequestError(400, "Reply text is required");
+  }
+
+  const entry = appendFeedEntry(session, match.role, match.participant.id, normalizedText);
+  sendEvent(session.host.channel, "text-feed", entry);
+
+  if (session.activeViewerId) {
+    const activeViewer = session.viewers.get(session.activeViewerId);
+    sendEvent(activeViewer?.channel, "text-feed", entry);
+  }
+
+  return entry;
+}
+
+function applyViewerDecision(session, match, viewerId, approved) {
+  assertHost(match);
+
+  const viewer = session.viewers.get(viewerId);
+  if (!viewer) {
+    throw createRequestError(404, "Viewer not found");
+  }
+
+  if (approved) {
+    if (session.activeViewerId && session.activeViewerId !== viewer.id) {
+      throw createRequestError(409, "Only one active viewer is supported in this MVP");
+    }
+
+    viewer.status = "approved";
+    session.activeViewerId = viewer.id;
+    sendEvent(viewer.channel, "join-approved", {
+      messages: summarizeFeed(session),
+      viewerId: viewer.id,
+    });
+    return { ok: true };
+  }
+
+  viewer.status = "denied";
+  sendEvent(viewer.channel, "join-denied", { viewerId: viewer.id });
+  closeChannel(viewer.channel);
+  viewer.channel = null;
+  session.viewers.delete(viewer.id);
+  return { ok: true };
+}
+
+async function handleRealtimeAction(session, match, channel, message) {
+  const requestId = message?.requestId || null;
+
+  try {
+    switch (message?.type) {
+      case "decision": {
+        const data = applyViewerDecision(session, match, message.viewerId, Boolean(message.approved));
+        sendSocketResponse(channel, requestId, { data });
+        return;
+      }
+      case "signal": {
+        sendSignalToParticipant(session, match, message.toId, message.signalType, message.payload);
+        sendSocketResponse(channel, requestId, { data: { ok: true } });
+        return;
+      }
+      case "feed": {
+        const entry = postFeedEntry(session, match, message.text);
+        sendSocketResponse(channel, requestId, { data: { entry, ok: true } });
+        return;
+      }
+      case "leave": {
+        sendSocketResponse(channel, requestId, { data: { ok: true } });
+        if (match.role === "host") {
+          endSession(session, "Host ended the session");
+        } else {
+          removeViewer(session, match.participant.id, "Viewer left");
+        }
+        return;
+      }
+      default:
+        throw createRequestError(400, "Unknown WebSocket message type");
+    }
+  } catch (error) {
+    sendSocketResponse(channel, requestId, {
+      error: error.message,
+      ok: false,
+      statusCode: error.statusCode || 500,
+    });
+  }
+}
+
+function rejectUpgrade(socket, statusCode, statusText) {
+  if (socket.destroyed) {
+    return;
+  }
+
+  socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\n\r\n`);
+  socket.destroy();
+}
+
+function handleSocketData(session, match, channel, chunk) {
+  channel.buffer = Buffer.concat([channel.buffer, chunk]);
+
+  while (channel.buffer.length) {
+    let frame = null;
+
+    try {
+      frame = parseWebSocketFrame(channel.buffer);
+    } catch {
+      closeChannel(channel);
+      return;
+    }
+
+    if (!frame) {
+      return;
+    }
+
+    channel.buffer = channel.buffer.subarray(frame.length);
+
+    if (frame.opcode === 0x8) {
+      closeChannel(channel);
+      return;
+    }
+
+    if (frame.opcode === 0x9) {
+      if (isChannelOpen(channel)) {
+        writeWebSocketFrame(channel.socket, 0xA, frame.payload);
+      }
+      continue;
+    }
+
+    if (frame.opcode === 0xA) {
+      continue;
+    }
+
+    if (frame.opcode !== 0x1) {
+      closeChannel(channel);
+      return;
+    }
+
+    let message = null;
+    try {
+      message = JSON.parse(frame.payload.toString("utf8"));
+    } catch {
+      sendEvent(channel, "response", {
+        error: "Invalid WebSocket JSON payload",
+        ok: false,
+        requestId: null,
+        statusCode: 400,
+      });
+      continue;
+    }
+
+    void handleRealtimeAction(session, match, channel, message);
+  }
+}
+
+function handleWebSocketUpgrade(req, socket, head) {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  if (url.pathname !== "/ws") {
+    rejectUpgrade(socket, 404, "Not Found");
+    return;
+  }
+
+  const sessionId = getRequestedSessionId(url.searchParams.get("sessionId") || url.searchParams.get("code"));
+  const clientId = url.searchParams.get("clientId");
+  const token = url.searchParams.get("token");
+  const session = getSession(sessionId);
+  const match = validateParticipant(session, clientId, token);
+
+  if (!match) {
+    rejectUpgrade(socket, 401, "Unauthorized");
+    return;
+  }
+
+  const websocketKey = req.headers["sec-websocket-key"];
+  if (!websocketKey) {
+    rejectUpgrade(socket, 400, "Bad Request");
+    return;
+  }
+
+  const acceptKey = crypto
+    .createHash("sha1")
+    .update(`${websocketKey}${WEBSOCKET_GUID}`)
+    .digest("base64");
+
+  socket.write(
+    [
+      "HTTP/1.1 101 Switching Protocols",
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      `Sec-WebSocket-Accept: ${acceptKey}`,
+      "\r\n",
+    ].join("\r\n")
+  );
+
+  socket.setNoDelay(true);
+
+  const channel = createWebSocketChannel(socket, head);
+  replaceParticipantChannel(match.participant, channel);
+  sendParticipantSnapshot(channel, session, match);
+
+  let closed = false;
+  const handleClose = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    channel.closed = true;
+    handleParticipantDisconnect(
+      session,
+      match,
+      channel,
+      match.role === "host" ? "Host disconnected" : "Viewer disconnected"
+    );
+  };
+
+  socket.on("data", (chunk) => {
+    handleSocketData(session, match, channel, chunk);
+  });
+  socket.on("close", handleClose);
+  socket.on("end", handleClose);
+  socket.on("error", handleClose);
+
+  if (channel.buffer.length) {
+    handleSocketData(session, match, channel, Buffer.alloc(0));
+  }
+}
+
 async function handleApi(req, res, url) {
   if (req.method === "OPTIONS") {
     applyCorsHeaders(res);
@@ -406,7 +914,7 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/sessions") {
     const session = {
       activeViewerId: null,
-      code: createCode(),
+      sessionId: createSessionId(),
       createdAt: Date.now(),
       endedAt: null,
       feed: [],
@@ -414,20 +922,23 @@ async function handleApi(req, res, url) {
       viewers: new Map(),
     };
 
-    sessions.set(session.code, session);
+    sessions.set(session.sessionId, session);
     sendJson(res, 201, {
       clientId: session.host.id,
-      code: session.code,
+      code: session.sessionId,
+      sessionId: session.sessionId,
       token: session.host.token,
     });
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/events") {
-    const code = url.searchParams.get("code");
+    const sessionId = getRequestedSessionId(
+      url.searchParams.get("sessionId") || url.searchParams.get("code")
+    );
     const clientId = url.searchParams.get("clientId");
     const token = url.searchParams.get("token");
-    const session = getSession(code);
+    const session = getSession(sessionId);
     const match = validateParticipant(session, clientId, token);
 
     if (!match) {
@@ -435,10 +946,7 @@ async function handleApi(req, res, url) {
       return;
     }
 
-    if (match.participant.channel && !match.participant.channel.writableEnded) {
-      match.participant.channel.end();
-    }
-    match.participant.channel = res;
+    replaceParticipantChannel(match.participant, res);
 
     res.writeHead(200, {
       "Access-Control-Allow-Origin": CORS_ALLOW_ORIGIN,
@@ -448,40 +956,15 @@ async function handleApi(req, res, url) {
     });
 
     res.write("\n");
-    sendEvent(res, "connected", {
-      code: session.code,
-      role: match.role,
-      serverTime: new Date().toISOString(),
-    });
-
-    if (match.role === "host") {
-      sendEvent(res, "session-state", {
-        activeViewerId: session.activeViewerId,
-        viewers: summarizeViewers(session),
-      });
-      sendEvent(res, "feed-state", {
-        messages: summarizeFeed(session),
-      });
-    } else if (match.participant.status === "approved") {
-      sendEvent(res, "join-approved", {
-        messages: summarizeFeed(session),
-        viewerId: match.participant.id,
-      });
-    } else if (match.participant.status === "denied") {
-      sendEvent(res, "join-denied", { viewerId: match.participant.id });
-    }
+    sendParticipantSnapshot(res, session, match);
 
     req.on("close", () => {
-      if (match.participant.channel === res) {
-        match.participant.channel = null;
-      }
-
-      if (match.role === "host") {
-        endSession(session, "Host disconnected");
-        return;
-      }
-
-      removeViewer(session, match.participant.id, "Viewer disconnected");
+      handleParticipantDisconnect(
+        session,
+        match,
+        res,
+        match.role === "host" ? "Host disconnected" : "Viewer disconnected"
+      );
     });
 
     return;
@@ -489,7 +972,7 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/join") {
     const body = await readJsonBody(req);
-    const session = getSession(body.code);
+    const session = getSession(body.sessionId || body.code);
 
     if (!session) {
       sendJson(res, 404, { error: "Session not found" });
@@ -510,7 +993,8 @@ async function handleApi(req, res, url) {
 
     sendJson(res, 201, {
       clientId: viewer.id,
-      code: session.code,
+      code: session.sessionId,
+      sessionId: session.sessionId,
       token: viewer.token,
     });
     return;
@@ -518,52 +1002,26 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/decision") {
     const body = await readJsonBody(req);
-    const session = getSession(body.code);
+    const session = getSession(body.sessionId || body.code);
     const match = validateParticipant(session, body.clientId, body.token);
 
-    if (!match || match.role !== "host") {
+    if (!match) {
       sendJson(res, 401, { error: "Only the host can approve viewers" });
       return;
     }
 
-    const viewer = session.viewers.get(body.viewerId);
-    if (!viewer) {
-      sendJson(res, 404, { error: "Viewer not found" });
-      return;
+    try {
+      const data = applyViewerDecision(session, match, body.viewerId, Boolean(body.approved));
+      sendJson(res, 200, data);
+    } catch (error) {
+      sendJson(res, error.statusCode || 500, { error: error.message });
     }
-
-    if (body.approved) {
-      if (session.activeViewerId && session.activeViewerId !== viewer.id) {
-        sendJson(res, 409, {
-          error: "Only one active viewer is supported in this MVP",
-        });
-        return;
-      }
-
-      viewer.status = "approved";
-      session.activeViewerId = viewer.id;
-      sendEvent(viewer.channel, "join-approved", {
-        messages: summarizeFeed(session),
-        viewerId: viewer.id,
-      });
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    viewer.status = "denied";
-    sendEvent(viewer.channel, "join-denied", { viewerId: viewer.id });
-    if (viewer.channel && !viewer.channel.writableEnded) {
-      viewer.channel.end();
-    }
-    viewer.channel = null;
-    session.viewers.delete(viewer.id);
-    sendJson(res, 200, { ok: true });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/signal") {
     const body = await readJsonBody(req);
-    const session = getSession(body.code);
+    const session = getSession(body.sessionId || body.code);
     const match = validateParticipant(session, body.clientId, body.token);
 
     if (!match) {
@@ -571,35 +1029,18 @@ async function handleApi(req, res, url) {
       return;
     }
 
-    if (match.role === "host") {
-      if (session.activeViewerId !== body.toId) {
-        sendJson(res, 403, { error: "Viewer is not active" });
-        return;
-      }
-    } else if (session.activeViewerId !== match.participant.id || body.toId !== session.host.id) {
-      sendJson(res, 403, { error: "Viewer is not approved" });
-      return;
+    try {
+      sendSignalToParticipant(session, match, body.toId, body.signalType, body.payload);
+      sendJson(res, 200, { ok: true });
+    } catch (error) {
+      sendJson(res, error.statusCode || 500, { error: error.message });
     }
-
-    const recipientMatch = getParticipant(session, body.toId);
-    if (!recipientMatch) {
-      sendJson(res, 404, { error: "Signal recipient not found" });
-      return;
-    }
-
-    sendEvent(recipientMatch.participant.channel, "signal", {
-      fromId: match.participant.id,
-      payload: body.payload,
-      signalType: body.signalType,
-    });
-
-    sendJson(res, 200, { ok: true });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/feed") {
     const body = await readJsonBody(req);
-    const session = getSession(body.code);
+    const session = getSession(body.sessionId || body.code);
     const match = validateParticipant(session, body.clientId, body.token);
 
     if (!match) {
@@ -607,35 +1048,21 @@ async function handleApi(req, res, url) {
       return;
     }
 
-    if (!canExchangeFeed(session, match)) {
-      sendJson(res, 403, { error: "Feed is available only during an approved session" });
-      return;
+    try {
+      const entry = postFeedEntry(session, match, body.text);
+      sendJson(res, 200, {
+        entry,
+        ok: true,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 500, { error: error.message });
     }
-
-    const text = normalizeFeedText(body.text);
-    if (!text) {
-      sendJson(res, 400, { error: "Reply text is required" });
-      return;
-    }
-
-    const entry = appendFeedEntry(session, match.role, match.participant.id, text);
-    sendEvent(session.host.channel, "text-feed", entry);
-
-    if (session.activeViewerId) {
-      const activeViewer = session.viewers.get(session.activeViewerId);
-      sendEvent(activeViewer?.channel, "text-feed", entry);
-    }
-
-    sendJson(res, 200, {
-      entry,
-      ok: true,
-    });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/leave") {
     const body = await readJsonBody(req);
-    const session = getSession(body.code);
+    const session = getSession(body.sessionId || body.code);
     const match = validateParticipant(session, body.clientId, body.token);
 
     if (!match) {
@@ -675,6 +1102,14 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     console.error(error);
     sendJson(res, 500, { error: "Server error" });
+  }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    handleWebSocketUpgrade(req, socket, head);
+  } catch {
+    rejectUpgrade(socket, 500, "Server Error");
   }
 });
 

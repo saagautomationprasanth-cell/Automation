@@ -3,6 +3,9 @@ let rtcConfig = {
 };
 
 const FEED_TEXT_MAX_LENGTH = 280;
+const REALTIME_REQUEST_TIMEOUT_MS = 10000;
+const SESSION_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const SESSION_ID_RAW_LENGTH = 12;
 const SERVER_URL_STORAGE_KEY = "hideMyScreen.serverUrl";
 const LOCAL_SERVER_URL = window.location.origin;
 
@@ -59,12 +62,14 @@ async function loadRuntimeConfig() {
 const hostState = {
   activeViewerId: null,
   clientId: null,
-  code: null,
-  eventSource: null,
   feedEntries: [],
   feedIds: new Set(),
+  pendingRequests: new Map(),
   pc: null,
   pendingViewers: new Map(),
+  requestSequence: 0,
+  sessionId: null,
+  socket: null,
   stream: null,
   token: null,
 };
@@ -72,14 +77,16 @@ const hostState = {
 const viewerState = {
   approved: false,
   clientId: null,
-  code: null,
-  eventSource: null,
   hostId: null,
   feedEntries: [],
   feedIds: new Set(),
+  pendingRequests: new Map(),
   playbackPromptShown: false,
   pc: null,
+  requestSequence: 0,
   remoteStream: null,
+  sessionId: null,
+  socket: null,
   token: null,
 };
 
@@ -89,7 +96,7 @@ const elements = {
   clearViewerLogBtn: document.getElementById("clearViewerLogBtn"),
   enableRemoteAudioBtn: document.getElementById("enableRemoteAudioBtn"),
   endHostBtn: document.getElementById("endHostBtn"),
-  hostCode: document.getElementById("hostCode"),
+  hostSessionId: document.getElementById("hostSessionId"),
   hostFeedCount: document.getElementById("hostFeedCount"),
   hostFeedEmpty: document.getElementById("hostFeedEmpty"),
   hostFeedHighlight: document.getElementById("hostFeedHighlight"),
@@ -110,7 +117,7 @@ const elements = {
   startHostBtn: document.getElementById("startHostBtn"),
   serverUrlInput: document.getElementById("serverUrlInput"),
   useLocalServerBtn: document.getElementById("useLocalServerBtn"),
-  viewerCodeInput: document.getElementById("viewerCodeInput"),
+  viewerSessionIdInput: document.getElementById("viewerSessionIdInput"),
   viewerFeedCount: document.getElementById("viewerFeedCount"),
   viewerFeedEmpty: document.getElementById("viewerFeedEmpty"),
   viewerFeedInput: document.getElementById("viewerFeedInput"),
@@ -130,8 +137,21 @@ function formatTime(value = Date.now()) {
   });
 }
 
-function normalizeCode(value) {
-  return String(value || "").replace(/\D/g, "").slice(0, 6);
+function normalizeSessionId(value) {
+  const cleaned = String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .split("")
+    .filter((character) => SESSION_ID_ALPHABET.includes(character))
+    .join("")
+    .slice(0, SESSION_ID_RAW_LENGTH);
+
+  const groups = cleaned.match(/.{1,4}/g);
+  return groups ? groups.join("-") : "";
+}
+
+function hasCompleteSessionId(value) {
+  return normalizeSessionId(value).replace(/-/g, "").length === SESSION_ID_RAW_LENGTH;
 }
 
 function addLog(container, message) {
@@ -147,7 +167,7 @@ function addLog(container, message) {
 }
 
 function hasActiveSession() {
-  return Boolean(hostState.code || viewerState.code);
+  return Boolean(hostState.sessionId || viewerState.sessionId);
 }
 
 function rememberServerUrl(nextUrl) {
@@ -341,7 +361,42 @@ async function apiRequest(path, payload) {
   return data;
 }
 
-function wireEventSource(source, handlers) {
+function buildWebSocketUrl(sessionId, clientId, token) {
+  const url = new URL("/ws", connectionState.serverUrl);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.search = new URLSearchParams({ clientId, sessionId, token }).toString();
+  return url.toString();
+}
+
+function rejectPendingRequests(state, message) {
+  for (const pending of state.pendingRequests.values()) {
+    clearTimeout(pending.timeoutId);
+    pending.reject(new Error(message));
+  }
+
+  state.pendingRequests.clear();
+}
+
+function disconnectRealtime(state) {
+  if (!state.socket) {
+    rejectPendingRequests(state, "Real-time connection closed");
+    return;
+  }
+
+  const socket = state.socket;
+  state.socket = null;
+  rejectPendingRequests(state, "Real-time connection closed");
+  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    socket.close();
+  }
+}
+
+function wireRealtimeSocket(state, handlers) {
+  disconnectRealtime(state);
+
+  const socket = new WebSocket(buildWebSocketUrl(state.sessionId, state.clientId, state.token));
+  state.socket = socket;
+
   const registrations = [
     ["connected", handlers.connected],
     ["feed-state", handlers.feedState],
@@ -356,31 +411,95 @@ function wireEventSource(source, handlers) {
     ["viewer-request", handlers.viewerRequest],
   ];
 
-  for (const [eventName, handler] of registrations) {
-    if (!handler) {
-      continue;
+  const handlerMap = new Map(registrations.filter(([, handler]) => Boolean(handler)));
+
+  socket.addEventListener("message", (event) => {
+    let message = null;
+
+    try {
+      message = JSON.parse(event.data);
+    } catch (error) {
+      console.warn("Invalid WebSocket payload:", error);
+      return;
     }
 
-    source.addEventListener(eventName, (event) => {
-      const payload = JSON.parse(event.data);
-      handler(payload);
-    });
-  }
+    if (message.type === "response") {
+      const pending = state.pendingRequests.get(message.payload?.requestId);
+      if (!pending) {
+        return;
+      }
+
+      clearTimeout(pending.timeoutId);
+      state.pendingRequests.delete(message.payload.requestId);
+
+      if (message.payload.ok) {
+        pending.resolve(message.payload.data);
+        return;
+      }
+
+      pending.reject(new Error(message.payload.error || "Real-time request failed"));
+      return;
+    }
+
+    const handler = handlerMap.get(message.type);
+    if (handler) {
+      handler(message.payload);
+    }
+  });
+
+  socket.addEventListener("close", () => {
+    if (state.socket !== socket) {
+      return;
+    }
+
+    state.socket = null;
+    rejectPendingRequests(state, "Real-time connection closed");
+    handlers.closed?.();
+  });
+
+  socket.addEventListener("error", () => {
+    if (state.socket !== socket) {
+      return;
+    }
+
+    handlers.error?.(new Error("Real-time connection error"));
+  });
 }
 
-function buildEventSourceUrl(code, clientId, token) {
-  const params = new URLSearchParams({ clientId, code, token });
-  return buildApiUrl(`/api/events?${params.toString()}`);
+function sendRealtimeRequest(state, type, payload = {}) {
+  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("Real-time connection is not open"));
+  }
+
+  const requestId = `${state.clientId || "client"}_${Date.now()}_${state.requestSequence += 1}`;
+
+  state.socket.send(
+    JSON.stringify({
+      ...payload,
+      requestId,
+      type,
+    })
+  );
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      state.pendingRequests.delete(requestId);
+      reject(new Error("Real-time request timed out"));
+    }, REALTIME_REQUEST_TIMEOUT_MS);
+
+    state.pendingRequests.set(requestId, {
+      reject,
+      resolve,
+      timeoutId,
+    });
+  });
 }
 
 async function sendSignal(state, toId, signalType, payload) {
-  await apiRequest("/api/signal", {
-    clientId: state.clientId,
-    code: state.code,
+  await sendRealtimeRequest(state, "signal", {
     payload,
     signalType,
     toId,
-    token: state.token,
   });
 }
 
@@ -428,7 +547,7 @@ async function ensureDisplayStream() {
       hostState.stream = null;
       elements.localPreview.srcObject = null;
 
-      if (hostState.code) {
+      if (hostState.sessionId) {
         await leaveHostSession(false);
       }
     });
@@ -448,7 +567,7 @@ function destroyHostPeer() {
   }
 
   hostState.activeViewerId = null;
-  if (hostState.code) {
+  if (hostState.sessionId) {
     setHostStatus("Waiting");
   }
   renderPendingViewers();
@@ -554,7 +673,7 @@ function buildViewerPeer(hostId) {
 }
 
 function resetHostUi() {
-  elements.hostCode.textContent = "------";
+  elements.hostSessionId.textContent = "---- ---- ----";
   setHostStatus("Idle");
   elements.startHostBtn.disabled = false;
   elements.endHostBtn.disabled = true;
@@ -580,20 +699,26 @@ async function startHostSession() {
   try {
     await loadRuntimeConfig();
     const data = await apiRequest("/api/sessions", {});
-    hostState.code = data.code;
+    hostState.sessionId = data.sessionId || data.code;
     hostState.clientId = data.clientId;
     hostState.token = data.token;
-    elements.hostCode.textContent = data.code;
+    elements.hostSessionId.textContent = hostState.sessionId;
     setHostStatus("Waiting");
     elements.startHostBtn.disabled = true;
     elements.endHostBtn.disabled = false;
-    addLog(elements.hostLog, `Host session ${data.code} is ready.`);
+    addLog(elements.hostLog, `Host session ID ${hostState.sessionId} is ready.`);
 
-    const eventSource = new EventSource(buildEventSourceUrl(data.code, data.clientId, data.token));
-    hostState.eventSource = eventSource;
+    wireRealtimeSocket(hostState, {
+      closed: () => {
+        if (!hostState.sessionId) {
+          return;
+        }
 
-    wireEventSource(eventSource, {
-      connected: () => addLog(elements.hostLog, "Host channel connected."),
+        addLog(elements.hostLog, "Real-time connection closed.");
+        cleanupHostSession();
+      },
+      connected: () => addLog(elements.hostLog, "Host real-time channel connected."),
+      error: (error) => addLog(elements.hostLog, error.message),
       feedState: (payload) => {
         replaceFeedEntries(hostState, payload.messages);
         renderHostFeed();
@@ -655,8 +780,7 @@ async function startHostSession() {
 }
 
 function cleanupHostSession() {
-  hostState.eventSource?.close();
-  hostState.eventSource = null;
+  disconnectRealtime(hostState);
   destroyHostPeer();
 
   if (hostState.stream) {
@@ -668,21 +792,15 @@ function cleanupHostSession() {
 
   elements.localPreview.srcObject = null;
   hostState.clientId = null;
-  hostState.code = null;
+  hostState.sessionId = null;
   hostState.token = null;
   resetHostUi();
 }
 
 async function leaveHostSession(sendRequest = true) {
-  const payload = {
-    clientId: hostState.clientId,
-    code: hostState.code,
-    token: hostState.token,
-  };
-
   try {
-    if (sendRequest && hostState.code) {
-      await apiRequest("/api/leave", payload);
+    if (sendRequest && hostState.sessionId) {
+      await sendRealtimeRequest(hostState, "leave");
     }
   } catch (error) {
     addLog(elements.hostLog, `Host leave failed: ${error.message}`);
@@ -692,7 +810,7 @@ async function leaveHostSession(sendRequest = true) {
 }
 
 async function approveViewer(viewerId) {
-  if (!hostState.code || !hostState.clientId) {
+  if (!hostState.sessionId || !hostState.clientId) {
     return;
   }
 
@@ -703,11 +821,8 @@ async function approveViewer(viewerId) {
 
   try {
     await ensureDisplayStream();
-    await apiRequest("/api/decision", {
+    await sendRealtimeRequest(hostState, "decision", {
       approved: true,
-      clientId: hostState.clientId,
-      code: hostState.code,
-      token: hostState.token,
       viewerId,
     });
 
@@ -723,11 +838,8 @@ async function approveViewer(viewerId) {
 
 async function denyViewer(viewerId) {
   try {
-    await apiRequest("/api/decision", {
+    await sendRealtimeRequest(hostState, "decision", {
       approved: false,
-      clientId: hostState.clientId,
-      code: hostState.code,
-      token: hostState.token,
       viewerId,
     });
     hostState.pendingViewers.delete(viewerId);
@@ -739,18 +851,18 @@ async function denyViewer(viewerId) {
 }
 
 async function joinViewerSession() {
-  const code = normalizeCode(elements.viewerCodeInput.value);
-  elements.viewerCodeInput.value = code;
+  const sessionId = normalizeSessionId(elements.viewerSessionIdInput.value);
+  elements.viewerSessionIdInput.value = sessionId;
 
-  if (code.length !== 6) {
-    addLog(elements.viewerLog, "Enter a six-digit session code.");
+  if (!hasCompleteSessionId(sessionId)) {
+    addLog(elements.viewerLog, "Enter the full session ID, for example ABCD-EFGH-JKLM.");
     return;
   }
 
   try {
     await loadRuntimeConfig();
-    const data = await apiRequest("/api/join", { code });
-    viewerState.code = data.code;
+    const data = await apiRequest("/api/join", { sessionId });
+    viewerState.sessionId = data.sessionId || data.code;
     viewerState.clientId = data.clientId;
     viewerState.token = data.token;
     viewerState.approved = false;
@@ -758,13 +870,19 @@ async function joinViewerSession() {
     elements.joinViewerBtn.disabled = true;
     elements.leaveViewerBtn.disabled = false;
     updateViewerFeedComposer();
-    addLog(elements.viewerLog, `Join request sent for ${data.code}.`);
+    addLog(elements.viewerLog, `Join request sent for ${viewerState.sessionId}.`);
 
-    const eventSource = new EventSource(buildEventSourceUrl(data.code, data.clientId, data.token));
-    viewerState.eventSource = eventSource;
+    wireRealtimeSocket(viewerState, {
+      closed: () => {
+        if (!viewerState.sessionId) {
+          return;
+        }
 
-    wireEventSource(eventSource, {
-      connected: () => addLog(elements.viewerLog, "Viewer channel connected."),
+        addLog(elements.viewerLog, "Real-time connection closed.");
+        cleanupViewerSession();
+      },
+      connected: () => addLog(elements.viewerLog, "Viewer real-time channel connected."),
+      error: (error) => addLog(elements.viewerLog, error.message),
       joinApproved: (payload) => {
         viewerState.approved = true;
         replaceFeedEntries(viewerState, payload.messages);
@@ -810,7 +928,7 @@ async function joinViewerSession() {
 }
 
 async function sendViewerFeed() {
-  if (!viewerState.code || !viewerState.clientId || !viewerState.approved) {
+  if (!viewerState.sessionId || !viewerState.clientId || !viewerState.approved) {
     addLog(elements.viewerLog, "Wait for host approval before sending a reply.");
     return;
   }
@@ -822,11 +940,8 @@ async function sendViewerFeed() {
   }
 
   try {
-    const data = await apiRequest("/api/feed", {
-      clientId: viewerState.clientId,
-      code: viewerState.code,
+    const data = await sendRealtimeRequest(viewerState, "feed", {
       text,
-      token: viewerState.token,
     });
 
     storeFeedEntry(viewerState, data.entry);
@@ -840,25 +955,18 @@ async function sendViewerFeed() {
 }
 
 function cleanupViewerSession() {
-  viewerState.eventSource?.close();
-  viewerState.eventSource = null;
+  disconnectRealtime(viewerState);
   destroyViewerPeer();
   viewerState.clientId = null;
-  viewerState.code = null;
+  viewerState.sessionId = null;
   viewerState.token = null;
   resetViewerUi();
 }
 
 async function leaveViewerSession(sendRequest = true) {
-  const payload = {
-    clientId: viewerState.clientId,
-    code: viewerState.code,
-    token: viewerState.token,
-  };
-
   try {
-    if (sendRequest && viewerState.code) {
-      await apiRequest("/api/leave", payload);
+    if (sendRequest && viewerState.sessionId) {
+      await sendRealtimeRequest(viewerState, "leave");
     }
   } catch (error) {
     addLog(elements.viewerLog, `Viewer leave failed: ${error.message}`);
@@ -911,8 +1019,8 @@ elements.pendingList.addEventListener("click", async (event) => {
   }
 });
 
-elements.viewerCodeInput.addEventListener("input", () => {
-  elements.viewerCodeInput.value = normalizeCode(elements.viewerCodeInput.value);
+elements.viewerSessionIdInput.addEventListener("input", () => {
+  elements.viewerSessionIdInput.value = normalizeSessionId(elements.viewerSessionIdInput.value);
 });
 
 elements.viewerFeedInput.addEventListener("input", () => {
@@ -932,8 +1040,8 @@ elements.viewerFeedInput.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("beforeunload", () => {
-  hostState.eventSource?.close();
-  viewerState.eventSource?.close();
+  disconnectRealtime(hostState);
+  disconnectRealtime(viewerState);
 });
 
 elements.serverUrlInput.value = connectionState.serverUrl;
